@@ -1,0 +1,23 @@
+{
+  "local_watch_dir": "./watch",
+  "remote_host": "192.168.1.20",
+  "remote_user": "ubuntu",
+  "remote_dir": "/home/ubuntu/incoming",
+  "ssh_key_path": "~/.ssh/id_ed25519",
+  "file_stable_wait_seconds": 2,
+  "poll_interval_seconds": 5,
+  "log_file": "./logs/file_watcher.log",
+  "state_file": "./state/transfer_state.json",
+  "allowed_extensions": [],
+  "ignore_patterns": [
+    "*.part",
+    "*.tmp"
+  ],
+  "retry_attempts": 3,
+  "create_remote_dir": true,
+  "recursive": false,
+  "watch_mode": "auto",
+  "transfer_method": "auto",
+  "stable_checks_required": 2,
+  "delete_after_transfer": false
+}
