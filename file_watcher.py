@@ -54,11 +54,14 @@ def resolve_local_path(raw_path: str | None, base_dir: Path) -> Path | None:
     return path
 
 
-def normalize_extensions(values: list[str]) -> list[str]:
+def normalize_extensions(values: list[str], allow_wildcard: bool = False) -> list[str]:
     normalized = []
     for value in values:
         cleaned = value.strip().lower()
         if not cleaned:
+            continue
+        if allow_wildcard and cleaned == "*":
+            normalized.append(cleaned)
             continue
         normalized.append(cleaned if cleaned.startswith(".") else f".{cleaned}")
     return sorted(set(normalized))
@@ -84,6 +87,7 @@ class AppConfig:
     transfer_method: str = "auto"
     stable_checks_required: int = 2
     delete_after_transfer: bool = False
+    delete_extensions: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, config_path: Path) -> "AppConfig":
@@ -124,6 +128,7 @@ class AppConfig:
                 transfer_method=str(raw.get("transfer_method", "auto")).strip().lower(),
                 stable_checks_required=int(raw.get("stable_checks_required", 2)),
                 delete_after_transfer=bool(raw.get("delete_after_transfer", False)),
+                delete_extensions=normalize_extensions(list(raw.get("delete_extensions", [])), allow_wildcard=True),
             )
         except KeyError as exc:
             raise ConfigError(f"Missing required config field: {exc.args[0]}") from exc
@@ -645,6 +650,13 @@ class FileWatcherService:
 
     def _delete_local_file_if_requested(self, path: Path, expected_stat: os.stat_result) -> bool:
         if not self.config.delete_after_transfer:
+            return False
+        delete_all = "*" in self.config.delete_extensions
+        if not delete_all and path.suffix.lower() not in self.config.delete_extensions:
+            self.logger.info(
+                "Auto-delete skipped for %s because its extension is not in delete_extensions.",
+                path,
+            )
             return False
 
         expected_signature = (expected_stat.st_size, expected_stat.st_mtime_ns)

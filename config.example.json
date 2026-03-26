@@ -19,5 +19,8 @@
   "watch_mode": "auto",
   "transfer_method": "auto",
   "stable_checks_required": 2,
-  "delete_after_transfer": false
+  "delete_after_transfer": false,
+  "delete_extensions": [
+    "*"
+  ]
 }

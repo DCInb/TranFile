@@ -67,12 +67,14 @@ python3 file_watcher.py
 - `watch_mode`: `auto`, `watchdog`, or `polling`
 - `transfer_method`: `auto`, `rsync`, or `scp`
 - `stable_checks_required`: number of unchanged checks required before transfer
-- `delete_after_transfer`: delete the local file after a successful transfer
+- `delete_after_transfer`: enable post-transfer local file deletion
+- `delete_extensions`: only files with these extensions will be deleted, for example `[".bin", ".rst"]`; use `["*"]` to delete all transferred files, and if empty, no files are deleted
 
 ## Notes
 
 - In `auto` mode the service uses `watchdog` when the package is installed, otherwise it falls back to polling.
 - In `auto` transfer mode the service prefers `rsync` and falls back to `scp` if needed.
 - If a file fails all retries, it stays unconfirmed in the state file and will be retried on later scans.
-- If `delete_after_transfer` is enabled, deletion only happens after a successful send. If the local file changes again before deletion, it is kept locally and can be transferred again.
+- If `delete_after_transfer` is enabled, deletion only happens after a successful send and only for extensions listed in `delete_extensions`, unless `delete_extensions` contains `*`, which means delete all transferred files.
+- If the local file changes again before deletion, it is kept locally and can be transferred again.
 - The "Plan.md" is the file for codex to create the program.
