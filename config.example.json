@@ -8,6 +8,7 @@
   "poll_interval_seconds": 5,
   "log_file": "./logs/file_watcher.log",
   "state_file": "./state/transfer_state.json",
+  "lock_file": "./state/file_watcher.lock",
   "allowed_extensions": [],
   "ignore_patterns": [
     "*.part",
@@ -15,9 +16,12 @@
   ],
   "retry_attempts": 3,
   "create_remote_dir": true,
-  "recursive": false,
+  "recursive": true,
   "watch_mode": "auto",
   "transfer_method": "auto",
+  "rsync_compress": true,
+  "rsync_io_timeout_seconds": 300,
+  "transfer_wall_timeout_seconds": 7200,
   "stable_checks_required": 2,
   "delete_after_transfer": false,
   "delete_extensions": [

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -78,6 +80,7 @@ class AppConfig:
     poll_interval_seconds: float = 5.0
     log_file: Path = Path("logs/file_watcher.log")
     state_file: Path = Path("state/transfer_state.json")
+    lock_file: Path | None = None
     allowed_extensions: list[str] = field(default_factory=list)
     ignore_patterns: list[str] = field(default_factory=list)
     retry_attempts: int = 3
@@ -88,6 +91,9 @@ class AppConfig:
     stable_checks_required: int = 2
     delete_after_transfer: bool = False
     delete_extensions: list[str] = field(default_factory=list)
+    rsync_compress: bool = True
+    rsync_io_timeout_seconds: int = 300
+    transfer_wall_timeout_seconds: int = 7200
 
     @classmethod
     def load(cls, config_path: Path) -> "AppConfig":
@@ -119,6 +125,7 @@ class AppConfig:
                 or Path("logs/file_watcher.log"),
                 state_file=resolve_local_path(raw.get("state_file", "state/transfer_state.json"), base_dir)
                 or Path("state/transfer_state.json"),
+                lock_file=resolve_local_path(raw.get("lock_file"), base_dir),
                 allowed_extensions=normalize_extensions(list(raw.get("allowed_extensions", []))),
                 ignore_patterns=[str(item).strip() for item in raw.get("ignore_patterns", []) if str(item).strip()],
                 retry_attempts=int(raw.get("retry_attempts", 3)),
@@ -129,12 +136,19 @@ class AppConfig:
                 stable_checks_required=int(raw.get("stable_checks_required", 2)),
                 delete_after_transfer=bool(raw.get("delete_after_transfer", False)),
                 delete_extensions=normalize_extensions(list(raw.get("delete_extensions", [])), allow_wildcard=True),
+                rsync_compress=bool(raw.get("rsync_compress", True)),
+                rsync_io_timeout_seconds=int(raw.get("rsync_io_timeout_seconds", 300)),
+                transfer_wall_timeout_seconds=int(
+                    raw.get("transfer_wall_timeout_seconds", 7200)
+                ),
             )
         except KeyError as exc:
             raise ConfigError(f"Missing required config field: {exc.args[0]}") from exc
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"Invalid config value: {exc}") from exc
 
+        if config.lock_file is None:
+            config.lock_file = Path(f"{config.state_file}.lock")
         config.validate()
         return config
 
@@ -153,6 +167,10 @@ class AppConfig:
             raise ConfigError("retry_attempts must be at least 1.")
         if self.stable_checks_required < 2:
             raise ConfigError("stable_checks_required must be at least 2.")
+        if self.rsync_io_timeout_seconds <= 0:
+            raise ConfigError("rsync_io_timeout_seconds must be greater than 0.")
+        if self.transfer_wall_timeout_seconds <= 0:
+            raise ConfigError("transfer_wall_timeout_seconds must be greater than 0.")
         if self.watch_mode not in {"auto", "watchdog", "polling"}:
             raise ConfigError("watch_mode must be one of: auto, watchdog, polling.")
         if self.transfer_method not in {"auto", "rsync", "scp"}:
@@ -206,8 +224,17 @@ class StateStore:
     def _write(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_file.with_name(f"{self.state_file.name}.tmp")
-        tmp_path.write_text(json.dumps(self._data, indent=2, sort_keys=True), encoding="utf-8")
+        with tmp_path.open("w", encoding="utf-8") as stream:
+            json.dump(self._data, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
         tmp_path.replace(self.state_file)
+        directory_fd = os.open(self.state_file.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def was_successful(self, path: Path, file_size: int, file_mtime_ns: int) -> bool:
         with self._lock:
@@ -304,7 +331,10 @@ class TransferClient:
         raise ConfigError("No supported transfer command is available locally. Install rsync or scp.")
 
     def _ssh_base_args(self) -> list[str]:
-        args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+        args = [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4",
+        ]
         if self.config.ssh_key_path:
             args.extend(["-i", str(self.config.ssh_key_path)])
         return args
@@ -370,19 +400,24 @@ class TransferClient:
 
         if self.config.recursive:
             source = f"{self.config.local_watch_dir.as_posix()}/./{relative_destination.as_posix()}"
+            relative_args = ["--relative"]
         else:
             source = str(local_path)
+            relative_args = []
 
         args = [
             "rsync",
-            "-az",
-            "--partial",
+            "-a",
+            *(["-z"] if self.config.rsync_compress else []),
+            "--partial-dir=.tranfile-partial",
+            f"--timeout={self.config.rsync_io_timeout_seconds}",
+            *relative_args,
             "-e",
             self._rsync_ssh_command(),
             source,
             self._remote_spec(destination_root),
         ]
-        self._run_command(args)
+        self._run_command(args, timeout=self.config.transfer_wall_timeout_seconds)
 
     def _transfer_with_scp(self, local_path: Path, relative_destination: Path) -> None:
         remote_destination = PurePosixPath(self.config.remote_dir) / PurePosixPath(relative_destination.as_posix())
@@ -391,7 +426,39 @@ class TransferClient:
             self._run_remote_command(f"mkdir -p -- {shlex.quote(remote_parent)}", timeout=15)
 
         args = [*self._scp_base_args(), str(local_path), self._remote_spec(str(remote_destination))]
-        self._run_command(args)
+        self._run_command(args, timeout=self.config.transfer_wall_timeout_seconds)
+
+
+class InstanceLock:
+    """Hold a nonblocking lifetime lock for one watcher/configuration."""
+
+    def __init__(self, path: Path, config_path: Path) -> None:
+        self.path = path
+        self.config_path = config_path
+        self.stream: Any | None = None
+
+    def __enter__(self) -> "InstanceLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.stream = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self.stream.close()
+            self.stream = None
+            raise ConfigError(f"Another watcher owns the instance lock: {self.path}") from exc
+        digest = hashlib.sha256(self.config_path.read_bytes()).hexdigest()
+        self.stream.seek(0)
+        self.stream.truncate()
+        self.stream.write(f"pid={os.getpid()} config_sha256={digest}\n")
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if self.stream is not None:
+            fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
+            self.stream.close()
+            self.stream = None
 
 
 class QueueingEventHandler(FileSystemEventHandler):
@@ -737,18 +804,20 @@ def main() -> int:
 
     try:
         config = AppConfig.load(args.config.resolve())
-        logger = setup_logging(config)
-        state_store = StateStore(config.state_file, logger)
-        transfer_client = TransferClient(config, logger)
-        validate_startup(config, logger, transfer_client)
+        assert config.lock_file is not None
+        with InstanceLock(config.lock_file, args.config.resolve()):
+            logger = setup_logging(config)
+            state_store = StateStore(config.state_file, logger)
+            transfer_client = TransferClient(config, logger)
+            validate_startup(config, logger, transfer_client)
 
-        if args.validate_only:
-            logger.info("Validation completed successfully.")
-            return 0
+            if args.validate_only:
+                logger.info("Validation completed successfully.")
+                return 0
 
-        service = FileWatcherService(config, logger, state_store, transfer_client)
-        install_signal_handlers(service, logger)
-        service.run()
+            service = FileWatcherService(config, logger, state_store, transfer_client)
+            install_signal_handlers(service, logger)
+            service.run()
         return 0
     except (ConfigError, CommandError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

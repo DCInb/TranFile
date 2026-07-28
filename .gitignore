@@ -1,6 +1,9 @@
 # Personal files
 config.json
 
+# Python
+__pycache__/
+
 # Logs
 logs/
 state/
