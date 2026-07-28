@@ -623,26 +623,41 @@ class FileWatcherService:
             except Empty:
                 continue
 
+            defer = False
             try:
-                self._process_file(path)
+                defer = self._process_file(path)
             except Exception:
                 self.logger.exception("Unexpected error while processing %s", path)
             finally:
                 with self._pending_lock:
                     self._pending_paths.discard(str(path))
-                self.queue.task_done()
+                try:
+                    # A file that changes during its stability window must yield the
+                    # single worker.  Put it at the tail so already-queued immutable
+                    # outputs can make progress; periodic scans remain a second path to
+                    # eventual retry if the file disappears before this enqueue.
+                    if defer and not self.stop_event.is_set():
+                        self.enqueue_file(path)
+                finally:
+                    self.queue.task_done()
 
-    def _process_file(self, path: Path) -> None:
+    def _process_file(self, path: Path) -> bool:
+        """Process one path, returning true when a changing file should be deferred."""
         if not self._matches_filters(path):
-            return
+            return False
 
         stable_stat = self._wait_for_stable_file(path)
         if stable_stat is None:
-            return
+            if self.stop_event.is_set():
+                return False
+            try:
+                return path.is_file() and self._matches_filters(path)
+            except OSError:
+                return False
 
         if self.state_store.was_successful(path, stable_stat.st_size, stable_stat.st_mtime_ns):
             self.logger.info("Skipping already-transferred file: %s", path)
-            return
+            return False
 
         last_error: str | None = None
         for attempt in range(1, self.config.retry_attempts + 1):
@@ -659,7 +674,7 @@ class FileWatcherService:
                     local_deleted=local_deleted,
                 )
                 self.logger.info("Transfer succeeded: %s", path)
-                return
+                return False
             except (CommandError, OSError, ValueError) as exc:
                 last_error = str(exc)
                 if attempt >= self.config.retry_attempts:
@@ -675,12 +690,13 @@ class FileWatcherService:
                     backoff_seconds,
                 )
                 if self.stop_event.wait(backoff_seconds):
-                    return
+                    return False
 
         if last_error is None:
             last_error = "Transfer failed for an unknown reason."
         self.state_store.mark_failure(path, stable_stat.st_size, stable_stat.st_mtime_ns, last_error)
         self.logger.error("Transfer failed after %s attempts for %s: %s", self.config.retry_attempts, path, last_error)
+        return False
 
     def _wait_for_stable_file(self, path: Path) -> os.stat_result | None:
         stable_reads = 0
@@ -706,6 +722,13 @@ class FileWatcherService:
             if signature == last_signature:
                 stable_reads += 1
             else:
+                if last_signature is not None:
+                    self.logger.info(
+                        "File changed during its stability window; deferring it behind "
+                        "other queued files: %s",
+                        path,
+                    )
+                    return None
                 last_signature = signature
                 stable_reads = 1
                 self.logger.info("Waiting for file to stabilize: %s", path)
